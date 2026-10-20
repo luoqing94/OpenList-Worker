@@ -1,0 +1,21 @@
+name: Deploy EdgeOne OpenList
+on:
+  push:
+    branches: [custom/live]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install EdgeOne CLI
+        run: npm i -g edgeone@latest
+      - name: Deploy
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+        run: edgeone makers deploy . -n openlist-worker -t "$EDGEONE_API_TOKEN" -e production
