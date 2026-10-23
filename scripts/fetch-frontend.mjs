@@ -133,7 +133,84 @@ function replaceDist(src) {
   copyManifestToRoot()
   stampFrontendVersion(src)
   patchManifestCredentials()
+  injectHeadPreloads()
   console.log(`✓ Frontend dist ready (${DEST})`)
+}
+
+/**
+ * 将底部 <script> var preloads = [...] 中的现代模块与主样式表同步注入到 <head> 中
+ * （仅在未配置 ASSET_URLS 时启用），让浏览器 HTML Preload Scanner 在解析首包时即刻
+ * 并行拉取主模块、依赖 chunk（含首屏高频路由 Layout / login）与主 CSS，消除底部脚本
+ * 串行触发导致的瀑布延迟。保留原 var preloads 脚本不变以兼容动态 CDN 回退。
+ */
+function injectHeadPreloads() {
+  if (process.env.ASSET_URLS) return
+  const idx = path.join(DEST, "index.html")
+  try {
+    if (!fs.existsSync(idx)) return
+    let html = fs.readFileSync(idx, "utf-8")
+    if (html.includes("<!-- edgeone-head-preloads -->")) return
+    const m = html.match(/var\s+preloads\s*=\s*(\[[\s\S]*?\]);/)
+    if (!m) return
+    const preloads = JSON.parse(m[1])
+    if (!Array.isArray(preloads)) return
+
+    let entrySrc = ""
+    const moduleHrefs = []
+    const cssHrefs = []
+    const seenModules = new Set()
+
+    for (const item of preloads) {
+      const tag = item?.tagName
+      const attrs = item?.attrs || {}
+      if (tag === "script" && attrs.type === "module" && typeof attrs.src === "string") {
+        entrySrc = attrs.src
+        seenModules.add(attrs.src)
+      } else if (tag === "link" && attrs.rel === "modulepreload" && typeof attrs.href === "string") {
+        if (!seenModules.has(attrs.href)) {
+          seenModules.add(attrs.href)
+          moduleHrefs.push(attrs.href)
+        }
+      } else if (tag === "link" && attrs.rel === "stylesheet" && typeof attrs.href === "string") {
+        cssHrefs.push(attrs.href)
+      }
+    }
+
+    const assetsDir = path.join(DEST, "assets")
+    if (fs.existsSync(assetsDir)) {
+      const files = fs.readdirSync(assetsDir)
+      for (const prefix of ["Layout-", "login-"]) {
+        const hit = files.find(
+          (f) => f.startsWith(prefix) && f.endsWith(".js") && !f.includes("-legacy-"),
+        )
+        if (hit) {
+          const href = `/assets/${hit}`
+          if (!seenModules.has(href)) {
+            seenModules.add(href)
+            moduleHrefs.push(href)
+          }
+        }
+      }
+    }
+
+    const tags = ["    <!-- edgeone-head-preloads -->"]
+    if (entrySrc) {
+      tags.push(`    <link rel="modulepreload" crossorigin href="${entrySrc}">`)
+    }
+    for (const href of moduleHrefs) {
+      tags.push(`    <link rel="modulepreload" crossorigin href="${href}">`)
+    }
+    for (const href of cssHrefs) {
+      tags.push(`    <link rel="stylesheet" crossorigin href="${href}">`)
+    }
+
+    if (tags.length <= 1) return
+    html = html.replace(/<\/head>/i, `${tags.join("\n")}\n  </head>`)
+    fs.writeFileSync(idx, html)
+    console.log(`  Injected ${tags.length - 1} static head preload/stylesheet tags into dist/index.html`)
+  } catch (err) {
+    console.warn(`  [fetch-frontend] inject head preloads skipped: ${err?.message || err}`)
+  }
 }
 
 /**
