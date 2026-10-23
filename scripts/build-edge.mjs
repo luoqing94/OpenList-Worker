@@ -172,12 +172,12 @@ async function build() {
   // EdgeOne Makers 的 Node 云函数入口。产物按平台约定落在项目根
   // cloud-functions/[[default]].js，但它**不入库**：EdgeOne 的构建命令
   // （edgeone.json -> pnpm run build）会在部署时执行本脚本重新生成。
-  await esbuild.build({
+  const makersResult = await esbuild.build({
     entryPoints: ["api/_makers.ts"],
     bundle: true,
     platform: "node",
     target: "node22",
-    outfile: "cloud-functions/[[default]].js",
+    write: false,
     minify: true,
     format: "esm",
     external: ["ssh2", "cpu-features", "iconv-lite", "mysql2"],
@@ -185,6 +185,62 @@ async function build() {
     loader: { ".html": "text", ".node": "empty" },
     plugins: [emptyNodeDriverPlugin, normalizeHtmlEolPlugin],
   })
+
+  // EdgeOne CLI (ZKe) 会将 node-functions/[[default]].js 的顶层代码内联进
+  // http.createServer 请求回调内的 `const mod_0 = (() => { ... })()`，
+  // 导致每次 HTTP 请求都重新执行整份 bundle（重新创建 Hono 实例与所有 WeakMap）。
+  // 这里提取顶层 import 声明置顶，并将主体逻辑包裹进惰性初始化函数，
+  // 缓存到 globalThis.__OPENLIST_MAKERS_MOD__，确保单进程只初始化一次。
+  let makersBody = makersResult.outputFiles[0].text
+  const hoistedImports = []
+  makersBody = makersBody.replace(
+    /import\s*(?:\*\s*as\s+[A-Za-z_$][\w$]*|\{[^}]*\}|[A-Za-z_$][\w$]*)\s*from\s*["'][^"']+["']\s*;?/g,
+    (m) => {
+      hoistedImports.push(m.endsWith(";") ? m : m + ";")
+      return ""
+    },
+  )
+  makersBody = makersBody.replace(/export\s*\{([^}]+)\}\s*;?/, (_, specifiers) => {
+    const props = specifiers
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const m = part.match(/^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/)
+        if (!m) return ""
+        const localName = m[1]
+        const exportedName = m[2] || m[1]
+        return `${exportedName}: ${localName}`
+      })
+      .filter(Boolean)
+      .join(", ")
+    return `return { ${props} };`
+  })
+
+  const wrappedMakersEsm = `${hoistedImports.join("\n")}
+function __initOpenListMakers() {
+${makersBody}
+}
+export function onRequest(context) {
+  var mod = globalThis.__OPENLIST_MAKERS_MOD__;
+  if (!mod) {
+    mod = globalThis.__OPENLIST_MAKERS_MOD__ = __initOpenListMakers();
+  }
+  return mod.onRequest(context);
+}
+export {
+  onRequest as default,
+  onRequest as onRequestGet,
+  onRequest as onRequestPost,
+  onRequest as onRequestPut,
+  onRequest as onRequestDelete,
+  onRequest as onRequestPatch,
+  onRequest as onRequestHead,
+  onRequest as onRequestOptions
+};
+`
+  fs.mkdirSync("cloud-functions", { recursive: true })
+  fs.writeFileSync("cloud-functions/[[default]].js", wrappedMakersEsm, "utf8")
 
   // EdgeOne Pages 官方约定的 Node Functions 目录是 node-functions/（平台
   // 文档的项目结构：node-functions/[[default]].js → catch-all，Node.js
